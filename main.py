@@ -1,7 +1,16 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
+import jwt
+from passlib.context import CryptContext
+
+from database import db, create_document, get_documents
+
+# App
 app = FastAPI()
 
 app.add_middleware(
@@ -12,13 +21,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Security / Auth
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALG = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Pydantic models
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    name: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class MeResponse(BaseModel):
+    id: str
+    email: EmailStr
+    name: Optional[str] = None
+    role: str = "user"
+
+# Helpers
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+
+def create_access_token(sub: str, email: str, role: str = "user") -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": sub,
+        "email": email,
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        email = payload.get("email")
+        sub = payload.get("sub")
+        if not email or not sub:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        # lookup user
+        user_doc = db["authuser"].find_one({"email": email}) if db else None
+        if not user_doc:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user_doc
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# Routes
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI Backend!"}
 
+
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
 
 @app.get("/test")
 def test_database():
@@ -31,38 +112,83 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
+
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
             response["database_url"] = "✅ Configured"
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
+
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
+    import os as _os
+    response["database_url"] = "✅ Set" if _os.getenv("DATABASE_URL") else "❌ Not Set"
+    response["database_name"] = "✅ Set" if _os.getenv("DATABASE_NAME") else "❌ Not Set"
+
     return response
+
+
+@app.post("/auth/register", response_model=TokenResponse)
+def register(payload: RegisterRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    email = payload.email.lower()
+    # unique email check
+    existing = db["authuser"].find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user_doc = {
+        "email": email,
+        "name": payload.name or email.split("@")[0],
+        "password_hash": hash_password(payload.password),
+        "is_active": True,
+        "role": "user",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    result = db["authuser"].insert_one(user_doc)
+    user_id = str(result.inserted_id)
+    token = create_access_token(user_id, email, user_doc["role"])
+    return TokenResponse(access_token=token)
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(payload: LoginRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    email = payload.email.lower()
+    user = db["authuser"].find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_password(payload.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="User is inactive")
+
+    token = create_access_token(str(user.get("_id")), email, user.get("role", "user"))
+    return TokenResponse(access_token=token)
+
+
+@app.get("/auth/me", response_model=MeResponse)
+def me(current_user=Depends(get_current_user)):
+    return MeResponse(
+        id=str(current_user.get("_id")),
+        email=current_user.get("email"),
+        name=current_user.get("name"),
+        role=current_user.get("role", "user"),
+    )
 
 
 if __name__ == "__main__":
