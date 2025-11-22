@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,6 +47,52 @@ class MeResponse(BaseModel):
     name: Optional[str] = None
     role: str = "user"
 
+# Settings models
+class Member(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    role: str = Field("Editor", pattern="^(Owner|Admin|Editor)$")
+
+class SettingsPayload(BaseModel):
+    # Account
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    tz: Optional[str] = None
+    notifNew: Optional[bool] = None
+    notifVip: Optional[bool] = None
+    notifAi: Optional[bool] = None
+    twoFA: Optional[bool] = None
+
+    # Workspace
+    wsName: Optional[str] = None
+    members: Optional[List[Member]] = None
+
+    # AI
+    tone: Optional[int] = Field(None, ge=0, le=100)
+    brandVoice: Optional[str] = None
+    exampleReplies: Optional[str] = None
+    avoidWords: Optional[str] = None
+    aiAutoReply: Optional[bool] = None
+    maxReplyLen: Optional[int] = Field(None, ge=80, le=800)
+    profanity: Optional[bool] = None
+    keywords: Optional[List[str]] = None
+
+    # Integrations
+    integrations: Optional[List[dict]] = None
+
+    # Billing
+    plan: Optional[str] = None
+    cycle: Optional[str] = None
+    paymentMethod: Optional[str] = None
+
+    # App prefs
+    darkMode: Optional[bool] = None
+    language: Optional[str] = None
+    dtFormat: Optional[str] = None
+    defaultView: Optional[str] = None
+
+
 # Helpers
 
 def hash_password(password: str) -> str:
@@ -89,6 +135,51 @@ async def get_current_user(authorization: Optional[str] = Header(None)):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
+def default_settings_for_user(user_doc: dict) -> dict:
+    # sensible defaults matching the UI
+    return {
+        "user_id": str(user_doc.get("_id")),
+        "name": user_doc.get("name"),
+        "email": user_doc.get("email"),
+        "tz": "UTC",
+        "notifNew": True,
+        "notifVip": True,
+        "notifAi": False,
+        "twoFA": False,
+        "wsName": "Default Workspace",
+        "members": [
+            {
+                "id": str(user_doc.get("_id")),
+                "name": user_doc.get("name") or user_doc.get("email").split("@")[0],
+                "email": user_doc.get("email"),
+                "role": "Owner",
+            }
+        ],
+        "tone": 50,
+        "brandVoice": "Friendly, concise, helpful. Avoid jargon.",
+        "exampleReplies": "Thanks for reaching out! Here’s a quick answer…",
+        "avoidWords": "guarantee, promise, 100%",
+        "aiAutoReply": True,
+        "maxReplyLen": 280,
+        "profanity": True,
+        "keywords": ["DEMO", "GUIDE", "PRICING"],
+        "integrations": [
+            {"name": "Instagram", "key": "instagram", "connected": True},
+            {"name": "TikTok", "key": "tiktok", "connected": False},
+            {"name": "Facebook", "key": "facebook", "connected": False},
+            {"name": "Shopify", "key": "shopify", "connected": False},
+        ],
+        "plan": "Pro",
+        "cycle": "Monthly",
+        "paymentMethod": "Visa •••• 4242",
+        "darkMode": True,
+        "language": "English",
+        "dtFormat": "YYYY-MM-DD, 24h",
+        "defaultView": "Unified Inbox",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
 
 # Routes
 @app.get("/")
@@ -160,6 +251,10 @@ def register(payload: RegisterRequest):
     }
     result = db["authuser"].insert_one(user_doc)
     user_id = str(result.inserted_id)
+    # create default settings document for the user
+    settings_doc = default_settings_for_user({"_id": result.inserted_id, **user_doc})
+    db["settings"].insert_one(settings_doc)
+
     token = create_access_token(user_id, email, user_doc["role"])
     return TokenResponse(access_token=token)
 
@@ -189,6 +284,43 @@ def me(current_user=Depends(get_current_user)):
         name=current_user.get("name"),
         role=current_user.get("role", "user"),
     )
+
+
+# Settings endpoints
+@app.get("/settings")
+def get_settings(current_user=Depends(get_current_user)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    user_id = str(current_user.get("_id"))
+    doc = db["settings"].find_one({"user_id": user_id})
+    if not doc:
+        # create defaults on demand
+        doc = default_settings_for_user(current_user)
+        db["settings"].insert_one(doc)
+    # serialize
+    doc["id"] = str(doc.get("_id")) if doc.get("_id") else None
+    doc.pop("_id", None)
+    return doc
+
+
+@app.put("/settings")
+def update_settings(payload: SettingsPayload, current_user=Depends(get_current_user)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    user_id = str(current_user.get("_id"))
+    update_data = {k: v for k, v in payload.dict(exclude_unset=True).items()}
+    update_data["updated_at"] = datetime.now(timezone.utc)
+    res = db["settings"].find_one_and_update(
+        {"user_id": user_id},
+        {"$set": update_data},
+        upsert=True,
+        return_document=True,
+    )
+    # fetch updated
+    doc = db["settings"].find_one({"user_id": user_id})
+    doc["id"] = str(doc.get("_id")) if doc.get("_id") else None
+    doc.pop("_id", None)
+    return doc
 
 
 if __name__ == "__main__":
